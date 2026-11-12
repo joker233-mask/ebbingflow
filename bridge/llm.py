@@ -27,15 +27,35 @@ class LLMBridge:
 
     def _apply_provider_options(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         options = dict(kwargs)
-        thinking_mode = getattr(self.config, "thinking_mode", "")
-        if thinking_mode not in {"enabled", "disabled"}:
-            return options
+        extra_body = dict(options.pop("extra_body", {}) or {})
 
-        extra_body = dict(options.get("extra_body") or {})
-        thinking = dict(extra_body.get("thinking") or {})
-        thinking["type"] = thinking_mode
-        extra_body["thinking"] = thinking
-        options["extra_body"] = extra_body
+        # Explicit request-level thinking options take precedence over the
+        # provider default so OpenAI-compatible callers can enable reasoning.
+        thinking = extra_body.get("thinking")
+        if not isinstance(thinking, dict):
+            thinking = dict(thinking or {}) if thinking else {}
+        provided_thinking = options.pop("thinking", None)
+        if isinstance(provided_thinking, dict):
+            thinking.update(provided_thinking)
+        elif provided_thinking is not None:
+            thinking["type"] = str(provided_thinking)
+
+        if "type" not in thinking:
+            thinking_mode = getattr(self.config, "thinking_mode", "")
+            if thinking_mode in {"enabled", "disabled"}:
+                thinking["type"] = thinking_mode
+
+        if thinking:
+            extra_body["thinking"] = thinking
+
+        reasoning_effort = options.pop("reasoning_effort", None)
+        if reasoning_effort is None:
+            reasoning_effort = extra_body.get("reasoning_effort")
+        if reasoning_effort is not None:
+            extra_body["reasoning_effort"] = reasoning_effort
+
+        if extra_body:
+            options["extra_body"] = extra_body
         return options
 
     async def chat_completion(
@@ -99,3 +119,41 @@ class LLMBridge:
         except Exception as e:
             logger.error(f"[LLM Bridge] Stream Error: {e}")
             yield f"\n[AI 响应异常: {e}]"
+
+    async def chat_stream_events(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        **kwargs
+    ) -> AsyncGenerator[Dict[str, str], None]:
+        """Stream typed events so callers can forward reasoning_content separately."""
+        try:
+            temp = temperature if temperature is not None else self.config.temperature
+            kwargs = self._apply_provider_options(kwargs)
+            response = await self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                temperature=temp,
+                stream=True,
+                stream_options={"include_usage": True},
+                **kwargs
+            )
+            async for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    from core.monitoring import token_monitor
+                    token_monitor.record_llm_usage(
+                        category=self.category,
+                        input_tokens=chunk.usage.prompt_tokens,
+                        output_tokens=chunk.usage.completion_tokens
+                    )
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    content = getattr(delta, "content", None)
+                    if reasoning:
+                        yield {"type": "reasoning", "text": reasoning}
+                    if content:
+                        yield {"type": "content", "text": content}
+        except Exception as e:
+            logger.error(f"[LLM Bridge] Stream Error: {e}")
+            yield {"type": "content", "text": f"\n[AI 响应异常: {e}]"}

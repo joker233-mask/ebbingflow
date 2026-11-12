@@ -13,6 +13,7 @@ import hmac
 import hashlib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import uvicorn
 from contextlib import asynccontextmanager
@@ -821,6 +822,16 @@ async def lifespan(app: FastAPI):
     await close_pool()
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 active_connections: set[WebSocket] = set()
 
 
@@ -851,6 +862,8 @@ class OpenAIChatCompletionRequest(BaseModel):
     user_id: str | None = None
     user_token: str | None = None
     metadata: dict | None = None
+    thinking: dict | None = None
+    reasoning_effort: str | None = None
 
 
 def _message_content_to_text(content) -> str:
@@ -961,20 +974,37 @@ async def _chat_completion_chunks(req: OpenAIChatCompletionRequest, request: Req
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
 
-    async for chunk in engine.chat_stream(
+    llm_options = {}
+    extra_body = {}
+    if isinstance(req.thinking, dict) and req.thinking:
+        extra_body["thinking"] = req.thinking
+    if req.reasoning_effort:
+        extra_body["reasoning_effort"] = req.reasoning_effort
+    if extra_body:
+        llm_options["extra_body"] = extra_body
+
+    async for event in engine.chat_stream(
         user_input,
         chat_session,
         status_callback=_status_callback,
         external_system_prompt=external_system_prompt,
+        llm_options=llm_options,
+        stream_events=True,
     ):
-        if not chunk:
+        if not event:
             continue
+        if not isinstance(event, dict):
+            event = {"type": "content", "text": str(event)}
+        text = event.get("text") or ""
+        if not text:
+            continue
+        delta_key = "reasoning_content" if event.get("type") == "reasoning" else "content"
         yield {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": req.model,
-            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {delta_key: text}, "finish_reason": None}],
         }
 
     yield {

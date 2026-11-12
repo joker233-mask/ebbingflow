@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import AsyncGenerator, Callable, Awaitable, Optional, Any
+from typing import AsyncGenerator, Callable, Awaitable, Optional, Any, Dict
 
 from config import llm_config, memory_config, identity_config, neo4j_config
 from bridge.llm import LLMBridge
@@ -503,7 +503,9 @@ class ChatEngine:
         status_callback: Optional[Callable[..., Awaitable[None]]] = None,
         simulated_at: Optional[str] = None,
         external_system_prompt: Optional[str] = None,
-    ) -> AsyncGenerator[str, None]:
+        llm_options: Optional[Dict[str, Any]] = None,
+        stream_events: bool = False,
+    ) -> AsyncGenerator[Any, None]:
         from core.monitoring import token_monitor
         token_monitor.reset_for_new_turn()
 
@@ -681,9 +683,16 @@ class ChatEngine:
             messages.append({"role": d.get("role", "user"), "content": d.get("content", "")})
         messages.append({"role": "user", "content": user_input_refined})
 
-        async for chunk in self.bridge.chat_stream(messages):
-            full_ai_response += chunk
-            yield chunk
+        bridge_options = dict(llm_options or {})
+        if stream_events:
+            async for event in self.bridge.chat_stream_events(messages, **bridge_options):
+                if event.get("type") == "content":
+                    full_ai_response += event.get("text", "")
+                yield event
+        else:
+            async for chunk in self.bridge.chat_stream(messages, **bridge_options):
+                full_ai_response += chunk
+                yield chunk
         await _emit("07", "done")
 
         # --- 第四阶段: 记忆沉淀与上下文同步 (08-14) ---
